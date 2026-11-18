@@ -1,0 +1,9 @@
+# NVU Dashboard Apache template
+#
+# Web modes:
+#   fqdn
+#   ipv4
+#   localhost
+#
+# B6.2G will generate Apache configuration
+# from validated operator input.

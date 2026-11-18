@@ -1,0 +1,33 @@
+# Build and publication artifacts
+build/
+artifacts/
+checkpoints/
+verification/
+*.deb
+*.tar.gz
+
+# Qualified NVUN binaries are distributed outside ordinary Git
+installer/payload/nvun/*/bin/
+
+# Python-generated files
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+
+# Signing and private material
+keys-private/
+private-keys-v1.d/
+*.sec
+secring.gpg
+
+# Runtime credentials and wallet material
+rpc-client.env
+wallet.dat
+*.dat
+
+# Editor and OS debris
+*~
+*.swp
+.DS_Store

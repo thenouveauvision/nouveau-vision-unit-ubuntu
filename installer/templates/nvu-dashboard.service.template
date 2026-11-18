@@ -1,0 +1,6 @@
+# NVU Dashboard systemd template
+#
+# Production reference:
+#   /etc/systemd/system/nvu-dashboard.service
+#
+# B6.2G will promote the qualified generic form here.

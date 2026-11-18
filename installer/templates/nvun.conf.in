@@ -1,0 +1,26 @@
+# Nouveau-Vision Unit native node configuration
+# Managed by the NVU Ubuntu-native installer.
+
+# Node operation
+server=1
+daemon=0
+listen=1
+port=9333
+
+# Wallet subsystem enabled.
+# The unnamed default wallet is the native deployment baseline.
+
+# Local-only RPC
+rpcbind=127.0.0.1
+rpcallowip=127.0.0.1
+rpcport=9332
+rpcauth=@RPC_AUTH@
+
+# Local service logging is captured by systemd-journald.
+printtoconsole=1
+debuglogfile=0
+
+# Network address mapping is disabled.
+upnp=0
+natpmp=0
+listenonion=0

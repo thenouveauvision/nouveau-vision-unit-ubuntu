@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+
+set -u
+
+BIN_DIR="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 &&
+    pwd -P
+)"
+INSTALLER_ROOT="$(
+    cd -- "${BIN_DIR}/.." >/dev/null 2>&1 &&
+    pwd -P
+)"
+
+NVU_DASHBOARD_CLI_VERSION="0.2.0-dev"
+
+ROOT="/usr/local/lib/nvu/dashboard"
+RELEASES="$ROOT/releases"
+CURRENT="$ROOT/current"
+VENV="$ROOT/venv"
+
+DASHBOARD_SERVICE="nvu-dashboard.service"
+NVUN_SERVICE="nvun.service"
+
+BACKEND_SOCKET="/run/nvu-dashboard/nvu-dashboard.sock"
+BACKEND_ORIGIN="http://localhost"
+
+RPC_HOST="127.0.0.1"
+RPC_PORT="9332"
+
+APACHE_SITE="/etc/apache2/sites-available/nvu-dashboard.conf"
+
+usage() {
+    cat <<USAGE
+NVU Dashboard Management CLI
+
+Usage:
+  nvu-dashboard <command>
+
+Commands:
+  status          Show native Dashboard state
+  qualify         Run read-only qualification
+  install         Install Dashboard release (not implemented)
+  configure-web   Configure Dashboard web access (not implemented)
+  checkpoint      Create installation checkpoint (not implemented)
+  rollback        Roll back Dashboard release (not implemented)
+  version         Show CLI version
+  help            Show this help
+USAGE
+}
+
+command_version() {
+    printf 'nvu-dashboard %s\n' \
+        "$NVU_DASHBOARD_CLI_VERSION"
+}
+
+safe_systemctl_state() {
+    local action="$1"
+    local unit="$2"
+    local value
+
+    value="$(
+        systemctl "$action" "$unit" \
+            2>/dev/null || true
+    )"
+
+    if [[ -n "$value" ]]; then
+        printf '%s\n' "$value"
+    else
+        printf '%s\n' "unknown"
+    fi
+}
+
+discover_current_release() {
+    if sudo -n test -L "$CURRENT" 2>/dev/null; then
+        sudo -n readlink "$CURRENT" 2>/dev/null || true
+    fi
+}
+
+discover_resolved_release() {
+    if sudo -n test -L "$CURRENT" 2>/dev/null; then
+        sudo -n readlink -f "$CURRENT" 2>/dev/null || true
+    fi
+}
+
+discover_dashboard_version() {
+    local response
+
+    response="$(
+        sudo -n curl \
+            --silent \
+            --max-time 3 \
+            --unix-socket "$BACKEND_SOCKET" \
+            "${BACKEND_ORIGIN}/api/version" \
+            2>/dev/null || true
+    )"
+
+    if [[ -n "$response" ]]; then
+        printf '%s\n' "$response" |
+            jq -r \
+                '.dashboardVersion // empty' \
+                2>/dev/null || true
+    fi
+}
+
+discover_runtime_status() {
+    sudo -n curl \
+        --silent \
+        --max-time 3 \
+        --unix-socket "$BACKEND_SOCKET" \
+        "${BACKEND_ORIGIN}/api/status" \
+        2>/dev/null || true
+}
+
+json_boolean_or_empty() {
+    local expression="$1"
+    local json="$2"
+
+    printf '%s\n' "$json" |
+        jq -r \
+            "if ${expression} == null
+             then empty
+             else ${expression}
+             end" \
+            2>/dev/null || true
+}
+
+discover_server_name() {
+    if [[ -r "$APACHE_SITE" ]]; then
+        awk '
+            /^[[:space:]]*ServerName[[:space:]]+/ {
+                print $2
+                exit
+            }
+        ' "$APACHE_SITE"
+    fi
+}
+
+discover_web_mode() {
+    local hostname="$1"
+
+    if [[ -z "$hostname" ]]; then
+        printf '%s\n' "localhost"
+        return
+    fi
+
+    if [[ "$hostname" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        printf '%s\n' "ipv4"
+        return
+    fi
+
+    printf '%s\n' "fqdn"
+}
+
+discover_https() {
+    local hostname="$1"
+
+    if [[ -z "$hostname" ]]; then
+        printf '%s\n' "disabled"
+        return
+    fi
+
+    if curl \
+        --silent \
+        --fail \
+        --max-time 4 \
+        "https://${hostname}/api/version" \
+        >/dev/null 2>&1
+    then
+        printf '%s\n' "enabled"
+    else
+        printf '%s\n' "disabled"
+    fi
+}
+
+discover_certificate_state() {
+    local hostname="$1"
+    local cert_output
+
+    if [[ -z "$hostname" ]]; then
+        printf '%s\n' "n/a"
+        return
+    fi
+
+    if ! command -v certbot >/dev/null 2>&1; then
+        printf '%s\n' "not detected"
+        return
+    fi
+
+    cert_output="$(
+        sudo -n certbot certificates \
+            2>/dev/null || true
+    )"
+
+    if printf '%s\n' "$cert_output" |
+        grep -Fq \
+            "Certificate Name: ${hostname}"
+    then
+        printf '%s\n' "present"
+    else
+        printf '%s\n' "not detected"
+    fi
+}
+
+command_status() {
+    local dashboard_active
+    local dashboard_enabled
+    local nvun_active
+    local nvun_enabled
+    local current_target
+    local resolved_release
+    local dashboard_version
+    local runtime_json
+    local runtime_hostname
+    local runtime_p2p
+    local runtime_chain
+    local runtime_ibd
+    local runtime_online
+    local apache_state
+    local public_hostname
+    local web_mode
+    local https_state
+    local certificate_state
+    local public_url
+
+    dashboard_active="$(
+        safe_systemctl_state \
+            is-active \
+            "$DASHBOARD_SERVICE"
+    )"
+
+    dashboard_enabled="$(
+        safe_systemctl_state \
+            is-enabled \
+            "$DASHBOARD_SERVICE"
+    )"
+
+    nvun_active="$(
+        safe_systemctl_state \
+            is-active \
+            "$NVUN_SERVICE"
+    )"
+
+    nvun_enabled="$(
+        safe_systemctl_state \
+            is-enabled \
+            "$NVUN_SERVICE"
+    )"
+
+    current_target="$(
+        discover_current_release
+    )"
+
+    resolved_release="$(
+        discover_resolved_release
+    )"
+
+    dashboard_version="$(
+        discover_dashboard_version
+    )"
+
+    runtime_json="$(
+        discover_runtime_status
+    )"
+
+    runtime_hostname="$(
+        printf '%s\n' "$runtime_json" |
+            jq -r \
+                '.nvun.hostname // empty' \
+                2>/dev/null || true
+    )"
+
+    runtime_p2p="$(
+        printf '%s\n' "$runtime_json" |
+            jq -r \
+                '.nvun.p2pPort // empty' \
+                2>/dev/null || true
+    )"
+
+    runtime_chain="$(
+        printf '%s\n' "$runtime_json" |
+            jq -r \
+                '.nvun.chain // empty' \
+                2>/dev/null || true
+    )"
+
+    runtime_ibd="$(
+        json_boolean_or_empty \
+            '.nvun.initialBlockDownload' \
+            "$runtime_json"
+    )"
+
+    runtime_online="$(
+        json_boolean_or_empty \
+            '.nvun.online' \
+            "$runtime_json"
+    )"
+
+    apache_state="$(
+        safe_systemctl_state \
+            is-active \
+            apache2
+    )"
+
+    public_hostname="$(
+        discover_server_name
+    )"
+
+    web_mode="$(
+        discover_web_mode \
+            "$public_hostname"
+    )"
+
+    https_state="$(
+        discover_https \
+            "$public_hostname"
+    )"
+
+    certificate_state="$(
+        discover_certificate_state \
+            "$public_hostname"
+    )"
+
+    public_url=""
+
+    if [[ "$web_mode" == "fqdn" ||
+          "$web_mode" == "ipv4" ]]
+    then
+        if [[ "$https_state" == "enabled" ]]; then
+            public_url="https://${public_hostname}"
+        else
+            public_url="http://${public_hostname}"
+        fi
+    fi
+
+    echo "NVU Dashboard"
+    echo
+    echo "CLI:"
+    echo "  $NVU_DASHBOARD_CLI_VERSION"
+
+    echo
+    echo "Dashboard:"
+    if [[ -n "$dashboard_version" ]]; then
+        echo "  installed"
+        echo "  version $dashboard_version"
+    else
+        echo "  version unknown"
+    fi
+
+    echo
+    echo "Release:"
+    if [[ -n "$resolved_release" ]]; then
+        echo "  $resolved_release"
+    else
+        echo "  not detected"
+    fi
+
+    echo
+    echo "Current:"
+    if [[ -n "$current_target" ]]; then
+        echo "  $current_target"
+    else
+        echo "  not configured"
+    fi
+
+    echo
+    echo "Dashboard service:"
+    echo "  $dashboard_active"
+    echo "  $dashboard_enabled"
+
+    echo
+    echo "Backend:"
+    if sudo -n test -S "$BACKEND_SOCKET" 2>/dev/null; then
+        echo "  unix"
+        echo "  $BACKEND_SOCKET"
+    else
+        echo "  unavailable"
+    fi
+
+    echo
+    echo "NVUN:"
+    echo "  $nvun_active"
+    echo "  $nvun_enabled"
+
+    echo
+    echo "RPC:"
+    echo "  ${RPC_HOST}:${RPC_PORT}"
+
+    echo
+    echo "Node:"
+    echo "  ${runtime_hostname:-unknown}"
+    echo "  P2P ${runtime_p2p:-unknown}"
+    echo "  chain ${runtime_chain:-unknown}"
+
+    if [[ "$runtime_online" == "true" ]]; then
+        echo "  online"
+    else
+        echo "  offline/unknown"
+    fi
+
+    if [[ "$runtime_ibd" == "false" ]]; then
+        echo "  synchronized"
+    elif [[ "$runtime_ibd" == "true" ]]; then
+        echo "  initial block download"
+    else
+        echo "  sync state unknown"
+    fi
+
+    echo
+    echo "Web:"
+    echo "  $web_mode"
+
+    echo
+    echo "Public hostname:"
+    echo "  ${public_hostname:-not configured}"
+
+    echo
+    echo "Apache:"
+    echo "  $apache_state"
+
+    echo
+    echo "HTTPS:"
+    echo "  $https_state"
+
+    echo
+    echo "Certificate:"
+    echo "  $certificate_state"
+
+    echo
+    echo "Public URL:"
+    if [[ -n "$public_url" ]]; then
+        echo "  $public_url"
+    else
+        echo "  localhost only"
+    fi
+}
+
+command_qualify() {
+    local qualify_module="$INSTALLER_ROOT/lib/qualify-dashboard.sh"
+
+    if [[ ! -r "$qualify_module" ]]; then
+        echo "FAIL: qualify module unavailable:" >&2
+        echo "  $qualify_module" >&2
+        return 1
+    fi
+
+    # shellcheck source=/dev/null
+    source "$qualify_module"
+
+    qualify_main
+}
+
+not_implemented() {
+    printf '%s\n' \
+        "Command not implemented in $NVU_DASHBOARD_CLI_VERSION."
+    return 2
+}
+
+main() {
+    case "${1:-help}" in
+        status)
+            command_status
+            ;;
+        qualify)
+            command_qualify
+            ;;
+        install)
+            shift
+            exec "$INSTALLER_ROOT/lib/install-dashboard.sh" "$@"
+            ;;
+        configure-web)
+            shift
+            exec "$INSTALLER_ROOT/lib/configure-web.sh" "$@"
+            ;;
+        checkpoint)
+            not_implemented
+            ;;
+        rollback)
+            not_implemented
+            ;;
+        version|--version|-V)
+            command_version
+            ;;
+        help|--help|-h)
+            usage
+            ;;
+        *)
+            echo "Unknown command: $1" >&2
+            echo >&2
+            usage >&2
+            return 2
+            ;;
+    esac
+}
+
+main "$@"

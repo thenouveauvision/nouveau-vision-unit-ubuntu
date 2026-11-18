@@ -1,0 +1,1678 @@
+#!/usr/bin/env bash
+#
+# Nouveau-Vision Unit Unified CLI
+# Milestone: B6.2I
+#
+
+set -u
+
+BIN_DIR="$(
+    cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 &&
+    pwd -P
+)"
+
+INSTALLER_ROOT="$(
+    cd -- "${BIN_DIR}/.." >/dev/null 2>&1 &&
+    pwd -P
+)"
+
+VERSION_FILE="$INSTALLER_ROOT/VERSION"
+
+DASHBOARD_CLI="$INSTALLER_ROOT/bin/nvu-dashboard"
+
+NODE_INSTALLER="$INSTALLER_ROOT/lib/install-node.sh"
+DASHBOARD_INSTALLER="$INSTALLER_ROOT/lib/install-dashboard.sh"
+WEB_CONFIGURATOR="$INSTALLER_ROOT/lib/configure-web.sh"
+
+UNIFIED_PREFLIGHT="$INSTALLER_ROOT/lib/preflight-unified.sh"
+DASHBOARD_PREFLIGHT="$INSTALLER_ROOT/lib/preflight.sh"
+DASHBOARD_QUALIFY="$INSTALLER_ROOT/lib/qualify-dashboard.sh"
+
+FQDN=""
+
+usage() {
+    cat <<'USAGE'
+Nouveau-Vision Unit Unified Installer
+
+Usage:
+  nvu <command> [options]
+
+Commands:
+  version
+      Show Nouveau-Vision Unit component versions.
+
+  status
+      Show current NVU node and Dashboard status.
+
+  preflight
+      Run read-only installation preflight.
+
+  install --fqdn <hostname>
+      Install and configure the complete Nouveau-Vision Unit stack.
+
+  qualify --fqdn <hostname>
+      Run read-only full-stack qualification.
+
+  qualify-dashboard
+      Run Dashboard-specific qualification.
+
+  configure-web --fqdn <hostname>
+      Configure Apache and HTTPS for an installed Dashboard.
+
+  help
+      Show this help.
+
+Examples:
+  nvu status
+  nvu preflight
+  sudo nvu install --fqdn node.example.com
+  sudo nvu configure-web --fqdn node.example.com
+  sudo nvu qualify --fqdn node.example.com
+
+Current milestone:
+  B6.2I
+
+Safety:
+  Preflight is read-only.
+  Qualification is read-only and requires root privileges.
+  Installation and web configuration require root privileges.
+USAGE
+}
+
+require_executable() {
+    local path="$1"
+    local label="$2"
+
+    if [[ ! -x "$path" ]]; then
+        printf 'FAIL: %s unavailable: %s\n' \
+            "$label" \
+            "$path" >&2
+        return 1
+    fi
+}
+
+require_root() {
+    if [[ "$(id -u)" -ne 0 ]]; then
+        echo "FAIL: this command requires sudo/root." >&2
+        return 2
+    fi
+}
+
+parse_fqdn() {
+    FQDN=""
+
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --fqdn)
+                if [[ "$#" -lt 2 || -z "${2:-}" ]]; then
+                    echo "FAIL: --fqdn requires a hostname." >&2
+                    return 2
+                fi
+
+                FQDN="$2"
+                shift 2
+                ;;
+
+            *)
+                printf 'FAIL: unknown option: %s\n' "$1" >&2
+                return 2
+                ;;
+        esac
+    done
+
+    if [[ -z "$FQDN" ]]; then
+        echo "FAIL: --fqdn is required." >&2
+        return 2
+    fi
+
+    if [[ ! "$FQDN" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] ||
+       [[ "$FQDN" != *.* ]]
+    then
+        printf 'FAIL: invalid FQDN: %s\n' "$FQDN" >&2
+        return 2
+    fi
+}
+
+command_version() {
+    if [[ ! -r "$VERSION_FILE" ]]; then
+        printf 'FAIL: VERSION file unavailable: %s\n' \
+            "$VERSION_FILE" >&2
+        return 1
+    fi
+
+    cat "$VERSION_FILE"
+}
+
+command_status() {
+    require_executable \
+        "$DASHBOARD_CLI" \
+        "Dashboard CLI" || return $?
+
+    exec "$DASHBOARD_CLI" status "$@"
+}
+
+command_preflight() {
+    require_executable \
+        "$UNIFIED_PREFLIGHT" \
+        "Unified preflight" || return $?
+
+    exec "$UNIFIED_PREFLIGHT" "$@"
+}
+
+wait_for_nvun_sync() {
+    local timeout_seconds="${NVU_SYNC_TIMEOUT_SECONDS:-1800}"
+    local interval_seconds="${NVU_SYNC_INTERVAL_SECONDS:-10}"
+    local started_at
+    local now
+    local elapsed
+    local blockchain_json
+    local blocks
+    local headers
+    local progress
+    local progress_percent
+    local ibd
+
+    [[ "$timeout_seconds" =~ ^[0-9]+$ ]] &&
+    [[ "$timeout_seconds" -ge 1 ]] || {
+        echo "FAIL: invalid NVU_SYNC_TIMEOUT_SECONDS." >&2
+        return 4
+    }
+
+    [[ "$interval_seconds" =~ ^[0-9]+$ ]] &&
+    [[ "$interval_seconds" -ge 1 ]] || {
+        echo "FAIL: invalid NVU_SYNC_INTERVAL_SECONDS." >&2
+        return 4
+    }
+
+    echo
+    echo "=== PHASE: NVUN SYNCHRONIZATION ==="
+    printf 'Timeout:  %s seconds\n' "$timeout_seconds"
+    printf 'Interval: %s seconds\n' "$interval_seconds"
+
+    started_at="$(date +%s)"
+
+    while true; do
+        blockchain_json="$(
+            sudo -u nvu /usr/local/bin/nvu-cli \
+                -datadir=/var/lib/nvu/node \
+                -conf=/etc/nvu/nvun.conf \
+                getblockchaininfo 2>/dev/null || true
+        )"
+
+        if [[ -z "$blockchain_json" ]] ||
+           ! printf '%s\n' "$blockchain_json" |
+             jq -e \
+                '.chain == "main"
+                 and (.blocks | type == "number")
+                 and (.headers | type == "number")
+                 and (.verificationprogress | type == "number")
+                 and (.initialblockdownload | type == "boolean")' \
+                >/dev/null 2>&1
+        then
+            echo "FAIL: valid NVUN blockchain status is unavailable."
+            return 4
+        fi
+
+        blocks="$(
+            printf '%s\n' "$blockchain_json" |
+            jq -r '.blocks'
+        )"
+
+        headers="$(
+            printf '%s\n' "$blockchain_json" |
+            jq -r '.headers'
+        )"
+
+        progress="$(
+            printf '%s\n' "$blockchain_json" |
+            jq -r '.verificationprogress'
+        )"
+
+        progress_percent="$(
+            printf '%s\n' "$blockchain_json" |
+            jq -r '(.verificationprogress * 10000 | floor) / 100'
+        )"
+
+        ibd="$(
+            printf '%s\n' "$blockchain_json" |
+            jq -r '.initialblockdownload'
+        )"
+
+        now="$(date +%s)"
+        elapsed=$((now - started_at))
+
+        echo
+        printf 'NVUN synchronization:\n'
+        printf '  blocks:   %s\n' "$blocks"
+        printf '  headers:  %s\n' "$headers"
+        printf '  progress: %s%%\n' "$progress_percent"
+        printf '  IBD:      %s\n' "$ibd"
+        printf '  elapsed:  %s seconds\n' "$elapsed"
+
+        if [[ "$blocks" == "$headers" &&
+              "$progress" == "1" &&
+              "$ibd" == "false" ]]
+        then
+            echo
+            echo "PASS: NVUN synchronized."
+            return 0
+        fi
+
+        if [[ "$elapsed" -ge "$timeout_seconds" ]]; then
+            echo
+            echo "NVUN SYNCHRONIZATION INCOMPLETE"
+            echo
+            echo "NVUN remains installed, active, and enabled."
+            echo "Dashboard and web configuration were not started."
+            return 5
+        fi
+
+        sleep "$interval_seconds"
+    done
+}
+
+final_qualify_installation() {
+    local qualification_output=""
+    local qualification_rc=0
+    local result=""
+    local nvun_state=""
+    local rpc_state=""
+    local wallet_state=""
+    local dashboard_state=""
+    local runtime_state=""
+    local web_state=""
+    local dns_state=""
+    local certificate_state=""
+    local redirect_state=""
+    local review_count=""
+    local blocked_count=""
+    local blockchain_json=""
+    local wallet_json=""
+    local version_json=""
+    local status_json=""
+    local redirect=""
+    local installed_nvund_sha=""
+    local installed_cli_sha=""
+    local current_release=""
+    local runtime_meta=""
+    local socket_meta=""
+    local certificate_root=""
+
+    echo
+    echo "=== PHASE: FINAL UNIFIED QUALIFICATION ==="
+    echo
+
+    set +e
+    qualification_output="$(
+        "$UNIFIED_PREFLIGHT" \
+            --fqdn "$FQDN" \
+            2>&1
+    )"
+    qualification_rc=$?
+    set -e
+
+    printf '%s\n' "$qualification_output"
+
+    summary_value() {
+        local label="$1"
+
+        printf '%s\n' "$qualification_output" |
+            awk -v label="$label" '
+                $0 == label ":" {
+                    getline
+                    gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                    print
+                    exit
+                }
+            '
+    }
+
+    result="$(summary_value "Result")"
+    nvun_state="$(summary_value "NVUN")"
+    rpc_state="$(summary_value "RPC credential contract")"
+    wallet_state="$(summary_value "Wallet")"
+    dashboard_state="$(summary_value "Dashboard")"
+    runtime_state="$(summary_value "Dashboard runtime")"
+    web_state="$(summary_value "Web")"
+    dns_state="$(summary_value "DNS")"
+    certificate_state="$(summary_value "Certificate")"
+    redirect_state="$(summary_value "HTTP redirect")"
+
+    review_count="$(
+        printf '%s\n' "$qualification_output" |
+            awk '
+                /^[[:space:]]*REVIEW:/ {
+                    print $2
+                    exit
+                }
+            '
+    )"
+
+    blocked_count="$(
+        printf '%s\n' "$qualification_output" |
+            awk '
+                /^[[:space:]]*BLOCKED:/ {
+                    print $2
+                    exit
+                }
+            '
+    )"
+
+    echo
+    echo "=== FINAL CLASSIFICATION GATE ==="
+
+    printf 'Qualification exit code: %s\n' "$qualification_rc"
+    printf 'Result:                  %s\n' "${result:-UNKNOWN}"
+    printf 'NVUN:                    %s\n' "${nvun_state:-UNKNOWN}"
+    printf 'RPC credentials:         %s\n' "${rpc_state:-UNKNOWN}"
+    printf 'Wallet:                  %s\n' "${wallet_state:-UNKNOWN}"
+    printf 'Dashboard:               %s\n' "${dashboard_state:-UNKNOWN}"
+    printf 'Dashboard runtime:       %s\n' "${runtime_state:-UNKNOWN}"
+    printf 'Web:                     %s\n' "${web_state:-UNKNOWN}"
+    printf 'DNS:                     %s\n' "${dns_state:-UNKNOWN}"
+    printf 'Certificate:             %s\n' "${certificate_state:-UNKNOWN}"
+    printf 'HTTP redirect:           %s\n' "${redirect_state:-UNKNOWN}"
+    printf 'REVIEW count:            %s\n' "${review_count:-UNKNOWN}"
+    printf 'BLOCKED count:           %s\n' "${blocked_count:-UNKNOWN}"
+
+    if [[ "$qualification_rc" -ne 0 ||
+          "$result" != "INSTALLED" ||
+          "$nvun_state" != "INSTALLED" ||
+          "$rpc_state" != "AVAILABLE" ||
+          "$wallet_state" != "AVAILABLE" ||
+          "$dashboard_state" != "INSTALLED" ||
+          "$runtime_state" != "NVU_OWNED" ||
+          "$web_state" != "HTTPS_CONFIGURED" ||
+          "$dns_state" != "RESOLVES" ||
+          "$certificate_state" != "PRESENT" ||
+          "$redirect_state" != "QUALIFIED" ||
+          "$review_count" != "0" ||
+          "$blocked_count" != "0" ]]
+    then
+        echo
+        echo "FAIL: unified full-stack classification did not graduate."
+        return 4
+    fi
+
+    echo
+    echo "=== INDEPENDENT NVUN QUALIFICATION ==="
+
+    systemctl is-active --quiet nvun.service || {
+        echo "FAIL: nvun.service is not active."
+        return 4
+    }
+
+    systemctl is-enabled --quiet nvun.service || {
+        echo "FAIL: nvun.service is not enabled."
+        return 4
+    }
+
+    installed_nvund_sha="$(
+        sha256sum /usr/local/bin/nvund |
+            awk '{print $1}'
+    )"
+
+    installed_cli_sha="$(
+        sha256sum /usr/local/bin/nvu-cli |
+            awk '{print $1}'
+    )"
+
+    [[ "$installed_nvund_sha" == \
+       "c5154b355cb4969138fe816f48db6dc73614e3f6e6e7c2d2efd22cc2d0120bf8" ]] || {
+        echo "FAIL: installed nvund differs from the qualified binary."
+        return 4
+    }
+
+    [[ "$installed_cli_sha" == \
+       "13c79a6b13df15c770773137fcc8c538c9de8c624ffeb0e50e1248cdb572d0c5" ]] || {
+        echo "FAIL: installed nvu-cli differs from the qualified binary."
+        return 4
+    }
+
+    blockchain_json="$(
+        sudo -u nvu /usr/local/bin/nvu-cli \
+            -datadir=/var/lib/nvu/node \
+            -conf=/etc/nvu/nvun.conf \
+            getblockchaininfo 2>/dev/null || true
+    )"
+
+    printf '%s\n' "$blockchain_json" |
+        jq -e \
+            '.chain == "main"
+             and .blocks == .headers
+             and .verificationprogress == 1
+             and .initialblockdownload == false' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: NVUN main-chain synchronization qualification failed."
+                return 4
+            }
+
+    if ! ss -lnt |
+        grep -Eq '127\.0\.0\.1:9332[[:space:]]'
+    then
+        echo "FAIL: NVUN localhost RPC listener not detected."
+        return 4
+    fi
+
+    if ss -lnt |
+        grep -Eq \
+            '(^|[[:space:]])(0\.0\.0\.0|\*|\[::\]):9332[[:space:]]'
+    then
+        echo "FAIL: NVUN RPC is exposed beyond localhost."
+        return 4
+    fi
+
+    if ! ss -lnt |
+        grep -Eq ':(9333)[[:space:]]'
+    then
+        echo "FAIL: NVUN P2P listener not detected."
+        return 4
+    fi
+
+    echo "PASS: NVUN binaries, service, synchronization, and listeners qualified."
+
+    echo
+    echo "=== INDEPENDENT WALLET QUALIFICATION ==="
+
+    wallet_json="$(
+        sudo -u nvu /usr/local/bin/nvu-cli \
+            -datadir=/var/lib/nvu/node \
+            -conf=/etc/nvu/nvun.conf \
+            getwalletinfo 2>/dev/null || true
+    )"
+
+    printf '%s\n' "$wallet_json" |
+        jq -e \
+            '.walletname == ""
+             and .private_keys_enabled == true' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: supported wallet contract not confirmed."
+                return 4
+            }
+
+    sudo -u nvu /usr/local/bin/nvu-cli \
+        -datadir=/var/lib/nvu/node \
+        -conf=/etc/nvu/nvun.conf \
+        getbalance >/dev/null 2>&1 || {
+            echo "FAIL: wallet balance RPC unavailable."
+            return 4
+        }
+
+    echo "PASS: unnamed default wallet available."
+    echo "PASS: wallet private keys enabled."
+    echo "PASS: wallet balance RPC operational."
+
+    echo
+    echo "=== INDEPENDENT DASHBOARD QUALIFICATION ==="
+
+    systemctl is-active --quiet nvu-dashboard.service || {
+        echo "FAIL: nvu-dashboard.service is not active."
+        return 4
+    }
+
+    systemctl is-enabled --quiet nvu-dashboard.service || {
+        echo "FAIL: nvu-dashboard.service is not enabled."
+        return 4
+    }
+
+    [[ "$(systemctl show nvu-dashboard.service --property=User --value)" \
+       == "nvu" ]] || {
+        echo "FAIL: Dashboard service user differs from nvu."
+        return 4
+    }
+
+    [[ "$(systemctl show nvu-dashboard.service --property=Group --value)" \
+       == "www-data" ]] || {
+        echo "FAIL: Dashboard service group differs from www-data."
+        return 4
+    }
+
+    current_release="$(
+        readlink -f /usr/local/lib/nvu/dashboard/current 2>/dev/null ||
+        true
+    )"
+
+    [[ "$current_release" == \
+       "/usr/local/lib/nvu/dashboard/releases/1.3.0" ]] || {
+        echo "FAIL: Dashboard current release is not 1.3.0."
+        return 4
+    }
+
+    [[ -x /usr/local/lib/nvu/dashboard/venv/bin/gunicorn ]] || {
+        echo "FAIL: Dashboard production Gunicorn is unavailable."
+        return 4
+    }
+
+    runtime_meta="$(
+        stat \
+            -c '%U:%G %a %F' \
+            /run/nvu-dashboard \
+            2>/dev/null || true
+    )"
+
+    [[ "$runtime_meta" == "nvu:www-data 750 directory" ]] || {
+        printf 'FAIL: Dashboard runtime contract differs: %s\n' \
+            "${runtime_meta:-unknown}"
+        return 4
+    }
+
+    socket_meta="$(
+        stat \
+            -c '%U:%G %a %F' \
+            /run/nvu-dashboard/nvu-dashboard.sock \
+            2>/dev/null || true
+    )"
+
+    [[ "$socket_meta" == "nvu:www-data 770 socket" ]] || {
+        printf 'FAIL: Dashboard socket contract differs: %s\n' \
+            "${socket_meta:-unknown}"
+        return 4
+    }
+
+    [[ "$(systemctl show nvu-dashboard.service \
+        --property=ExecStart --value)" == \
+        *"unix:/run/nvu-dashboard/nvu-dashboard.sock"* ]] || {
+        echo "FAIL: Dashboard does not use the canonical Unix socket."
+        return 4
+    }
+
+    version_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 10 \
+            --unix-socket /run/nvu-dashboard/nvu-dashboard.sock \
+            http://localhost/api/version \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$version_json" |
+        jq -e \
+            '.dashboardVersion == "1.3.0"
+             and .ok == true
+             and .ticker == "NVU"' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: Dashboard version API qualification failed."
+                return 4
+            }
+
+    status_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 10 \
+            --unix-socket /run/nvu-dashboard/nvu-dashboard.sock \
+            http://localhost/api/status \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$status_json" |
+        jq -e \
+            '.ok == true
+             and .nvun.online == true
+             and .nvun.chain == "main"
+             and .nvun.initialBlockDownload == false' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: Dashboard-to-NVUN qualification failed."
+                return 4
+            }
+
+    if ss -lntp 2>/dev/null |
+        grep -Eq ':8080[[:space:]].*(gunicorn|python|nvu-dashboard)'
+    then
+        echo "FAIL: Dashboard unexpectedly exposes TCP port 8080."
+        return 4
+    fi
+
+    echo "PASS: Dashboard service and release qualified."
+    echo "PASS: Dashboard Unix-socket contract qualified."
+    echo "PASS: Dashboard APIs qualified."
+    echo "PASS: Dashboard has no TCP backend."
+
+    echo
+    echo "=== INDEPENDENT WEB QUALIFICATION ==="
+
+    systemctl is-active --quiet apache2.service || {
+        echo "FAIL: apache2.service is not active."
+        return 4
+    }
+
+    systemctl is-enabled --quiet apache2.service || {
+        echo "FAIL: apache2.service is not enabled."
+        return 4
+    }
+
+    apache2ctl -t >/dev/null 2>&1 || {
+        echo "FAIL: Apache configuration syntax is invalid."
+        return 4
+    }
+
+    [[ -L /etc/apache2/sites-enabled/nvu-dashboard.conf ]] || {
+        echo "FAIL: NVU HTTP virtual host is not enabled."
+        return 4
+    }
+
+    [[ -L /etc/apache2/sites-enabled/nvu-dashboard-le-ssl.conf ]] || {
+        echo "FAIL: NVU HTTPS virtual host is not enabled."
+        return 4
+    }
+
+    if ! grep -Fq \
+        'unix:/run/nvu-dashboard/nvu-dashboard.sock|' \
+        /etc/apache2/sites-available/nvu-dashboard.conf
+    then
+        echo "FAIL: NVU HTTP vhost does not use the canonical Unix socket."
+        return 4
+    fi
+
+    if ! grep -Fq \
+        'unix:/run/nvu-dashboard/nvu-dashboard.sock|' \
+        /etc/apache2/sites-available/nvu-dashboard-le-ssl.conf
+    then
+        echo "FAIL: NVU HTTPS vhost does not use the canonical Unix socket."
+        return 4
+    fi
+
+    if grep -REq \
+        '127\.0\.0\.1:8080|localhost:8080|0\.0\.0\.0:8080' \
+        /etc/apache2/sites-available/nvu-dashboard.conf \
+        /etc/apache2/sites-available/nvu-dashboard-le-ssl.conf
+    then
+        echo "FAIL: Apache references a prohibited Dashboard TCP backend."
+        return 4
+    fi
+
+    version_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 15 \
+            --resolve "${FQDN}:443:127.0.0.1" \
+            "https://${FQDN}/api/version" \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$version_json" |
+        jq -e \
+            '.dashboardVersion == "1.3.0"
+             and .ok == true
+             and .ticker == "NVU"' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: public HTTPS version API qualification failed."
+                return 4
+            }
+
+    status_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 15 \
+            --resolve "${FQDN}:443:127.0.0.1" \
+            "https://${FQDN}/api/status" \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$status_json" |
+        jq -e \
+            '.ok == true
+             and .nvun.online == true
+             and .nvun.chain == "main"
+             and .nvun.initialBlockDownload == false' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: public HTTPS status API qualification failed."
+                return 4
+            }
+
+    redirect="$(
+        curl \
+            --silent \
+            --show-error \
+            --output /dev/null \
+            --write-out '%{http_code} %{redirect_url}' \
+            --max-time 15 \
+            --resolve "${FQDN}:80:127.0.0.1" \
+            "http://${FQDN}/api/version" \
+            2>/dev/null || true
+    )"
+
+    if [[ "$redirect" != "301 https://${FQDN}/api/version" &&
+          "$redirect" != "308 https://${FQDN}/api/version" ]]
+    then
+        printf 'FAIL: HTTP redirect qualification failed: %s\n' \
+            "${redirect:-unavailable}"
+        return 4
+    fi
+
+    certificate_root="/etc/letsencrypt/live/$FQDN"
+
+    [[ -f "$certificate_root/fullchain.pem" ]] || {
+        echo "FAIL: certificate full chain is unavailable."
+        return 4
+    }
+
+    [[ -f "$certificate_root/privkey.pem" ]] || {
+        echo "FAIL: certificate private key is unavailable."
+        return 4
+    }
+
+    [[ -f "/etc/letsencrypt/renewal/$FQDN.conf" ]] || {
+        echo "FAIL: certificate renewal configuration is unavailable."
+        return 4
+    }
+
+    if ! ss -lntp 2>/dev/null |
+        grep -Eq ':80[[:space:]].*apache2'
+    then
+        echo "FAIL: Apache HTTP listener not detected."
+        return 4
+    fi
+
+    if ! ss -lntp 2>/dev/null |
+        grep -Eq ':443[[:space:]].*apache2'
+    then
+        echo "FAIL: Apache HTTPS listener not detected."
+        return 4
+    fi
+
+    echo "PASS: Apache service and syntax qualified."
+    echo "PASS: dedicated NVU HTTP and HTTPS vhosts qualified."
+    echo "PASS: public HTTPS APIs qualified."
+    echo "PASS: HTTP redirect qualified."
+    echo "PASS: certificate and renewal configuration qualified."
+    echo "PASS: Apache listeners qualified."
+
+    echo
+    echo "============================================================"
+    echo "NOUVEAU-VISION UNIT UNIFIED INSTALLATION PASSED"
+    echo "============================================================"
+    echo
+    echo "NVUN:"
+    echo "  1.0.0"
+    echo "  active"
+    echo "  enabled"
+    echo "  synchronized"
+    echo
+    echo "Wallet:"
+    echo "  available"
+    echo "  private keys enabled"
+    echo
+    echo "Dashboard:"
+    echo "  1.3.0"
+    echo "  active"
+    echo "  enabled"
+    echo
+    echo "Backend:"
+    echo "  Unix socket"
+    echo
+    echo "Web:"
+    echo "  HTTPS"
+    echo
+    echo "Public URL:"
+    printf '  https://%s\n' "$FQDN"
+    echo
+    echo "Qualification:"
+    echo "  PASS"
+    echo
+    echo "============================================================"
+
+    return 0
+}
+
+configure_and_qualify_web() {
+    local web_rc=0
+    local version_json=""
+    local status_json=""
+    local blockchain_json=""
+    local wallet_json=""
+    local redirect=""
+    local certificate_root=""
+
+    echo
+    echo "=== PRE-WEB DASHBOARD QUALIFICATION ==="
+
+    systemctl is-active --quiet nvu-dashboard.service || {
+        echo "FAIL: Dashboard service is not active."
+        return 4
+    }
+
+    systemctl is-enabled --quiet nvu-dashboard.service || {
+        echo "FAIL: Dashboard service is not enabled."
+        return 4
+    }
+
+    [[ -S /run/nvu-dashboard/nvu-dashboard.sock ]] || {
+        echo "FAIL: canonical Dashboard Unix socket is unavailable."
+        return 4
+    }
+
+    version_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 10 \
+            --unix-socket /run/nvu-dashboard/nvu-dashboard.sock \
+            http://localhost/api/version \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$version_json" |
+        jq -e \
+            '.dashboardVersion == "1.3.0"
+             and .ok == true
+             and .ticker == "NVU"' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: Dashboard version API is not ready for web configuration."
+                return 4
+            }
+
+    status_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 10 \
+            --unix-socket /run/nvu-dashboard/nvu-dashboard.sock \
+            http://localhost/api/status \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$status_json" |
+        jq -e \
+            '.ok == true
+             and .nvun.online == true
+             and .nvun.chain == "main"
+             and .nvun.initialBlockDownload == false' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: Dashboard-to-NVUN status is not ready for web configuration."
+                return 4
+            }
+
+    if ss -lntp 2>/dev/null |
+        grep -Eq ':8080[[:space:]].*(gunicorn|python|nvu-dashboard)'
+    then
+        echo "FAIL: Dashboard unexpectedly exposes TCP port 8080."
+        return 4
+    fi
+
+    echo "PASS: Dashboard is ready for public web configuration."
+    echo "PASS: Dashboard uses the canonical Unix socket."
+    echo "PASS: Dashboard has no TCP backend."
+
+    echo
+    echo "=== PHASE: WEB AND HTTPS CONFIGURATION ==="
+    echo
+
+    set +e
+    "$WEB_CONFIGURATOR" --fqdn "$FQDN"
+    web_rc=$?
+    set -e
+
+    if [[ "$web_rc" -ne 0 ]]; then
+        echo
+        echo "============================================================"
+        echo "NOUVEAU-VISION UNIT INSTALLATION STOPPED"
+        echo "============================================================"
+        echo
+        echo "Failed phase:"
+        echo "  Web and HTTPS"
+        echo
+        printf 'Web configurator exit code:\n  %s\n' "$web_rc"
+        echo
+        echo "Rollback ownership:"
+        echo "  configure-web.sh"
+        echo
+        echo "NVUN:"
+        echo "  INSTALLED"
+        echo "  synchronized"
+        echo
+        echo "Dashboard:"
+        echo "  INSTALLED"
+        echo "  active"
+        echo "  Unix socket"
+        echo
+        echo "Web:"
+        echo "  FAILED OR ROLLED BACK"
+        return 1
+    fi
+
+    echo
+    echo "=== POST-WEB QUALIFICATION ==="
+
+    systemctl is-active --quiet apache2.service || {
+        echo "FAIL: apache2.service is not active."
+        return 4
+    }
+
+    systemctl is-enabled --quiet apache2.service || {
+        echo "FAIL: apache2.service is not enabled."
+        return 4
+    }
+
+    apache2ctl -t >/dev/null 2>&1 || {
+        echo "FAIL: Apache configuration syntax is invalid."
+        return 4
+    }
+
+    version_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 15 \
+            --resolve "${FQDN}:443:127.0.0.1" \
+            "https://${FQDN}/api/version" \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$version_json" |
+        jq -e \
+            '.dashboardVersion == "1.3.0"
+             and .ok == true
+             and .ticker == "NVU"' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: public HTTPS Dashboard version qualification failed."
+                return 4
+            }
+
+    status_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 15 \
+            --resolve "${FQDN}:443:127.0.0.1" \
+            "https://${FQDN}/api/status" \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$status_json" |
+        jq -e \
+            '.ok == true
+             and .nvun.online == true
+             and .nvun.chain == "main"
+             and .nvun.initialBlockDownload == false' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: public HTTPS Dashboard status qualification failed."
+                return 4
+            }
+
+    redirect="$(
+        curl \
+            --silent \
+            --show-error \
+            --output /dev/null \
+            --write-out '%{http_code} %{redirect_url}' \
+            --max-time 15 \
+            --resolve "${FQDN}:80:127.0.0.1" \
+            "http://${FQDN}/api/version" \
+            2>/dev/null || true
+    )"
+
+    if [[ "$redirect" != "301 https://${FQDN}/api/version" &&
+          "$redirect" != "308 https://${FQDN}/api/version" ]]
+    then
+        printf 'FAIL: HTTP redirect qualification failed: %s\n' \
+            "${redirect:-unavailable}"
+        return 4
+    fi
+
+    certificate_root="/etc/letsencrypt/live/$FQDN"
+
+    [[ -f "$certificate_root/fullchain.pem" ]] || {
+        echo "FAIL: certificate full chain is unavailable."
+        return 4
+    }
+
+    [[ -f "$certificate_root/privkey.pem" ]] || {
+        echo "FAIL: certificate private key is unavailable."
+        return 4
+    }
+
+    if ! ss -lntp 2>/dev/null |
+        grep -Eq ':80[[:space:]].*apache2'
+    then
+        echo "FAIL: Apache HTTP listener not detected."
+        return 4
+    fi
+
+    if ! ss -lntp 2>/dev/null |
+        grep -Eq ':443[[:space:]].*apache2'
+    then
+        echo "FAIL: Apache HTTPS listener not detected."
+        return 4
+    fi
+
+    if ss -lntp 2>/dev/null |
+        grep -Eq ':8080[[:space:]].*(gunicorn|python|nvu-dashboard)'
+    then
+        echo "FAIL: Dashboard unexpectedly exposes TCP port 8080."
+        return 4
+    fi
+
+    blockchain_json="$(
+        sudo -u nvu /usr/local/bin/nvu-cli \
+            -datadir=/var/lib/nvu/node \
+            -conf=/etc/nvu/nvun.conf \
+            getblockchaininfo 2>/dev/null || true
+    )"
+
+    printf '%s\n' "$blockchain_json" |
+        jq -e \
+            '.chain == "main"
+             and .blocks == .headers
+             and .verificationprogress == 1
+             and .initialblockdownload == false' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: NVUN synchronization was not preserved."
+                return 4
+            }
+
+    wallet_json="$(
+        sudo -u nvu /usr/local/bin/nvu-cli \
+            -datadir=/var/lib/nvu/node \
+            -conf=/etc/nvu/nvun.conf \
+            getwalletinfo 2>/dev/null || true
+    )"
+
+    printf '%s\n' "$wallet_json" |
+        jq -e \
+            '.walletname == ""
+             and .private_keys_enabled == true' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: NVUN wallet contract was not preserved."
+                return 4
+            }
+
+    echo "PASS: Apache active, enabled, and syntax-valid."
+    echo "PASS: HTTPS Dashboard version API qualified."
+    echo "PASS: HTTPS Dashboard status API qualified."
+    echo "PASS: HTTP redirect preserves the API path."
+    echo "PASS: certificate files present."
+    echo "PASS: Apache listeners detected on ports 80 and 443."
+    echo "PASS: Dashboard has no TCP backend."
+    echo "PASS: NVUN synchronization and wallet were preserved."
+
+    echo
+    echo "============================================================"
+    echo "B6.2I-3E WEB PHASE PASSED"
+    echo "============================================================"
+    echo
+    echo "NVUN:"
+    echo "  INSTALLED"
+    echo "  synchronized"
+    echo
+    echo "Dashboard:"
+    echo "  INSTALLED"
+    echo "  active"
+    echo "  enabled"
+    echo "  version 1.3.0"
+    echo "  Unix socket"
+    echo
+    echo "Web:"
+    echo "  HTTPS_CONFIGURED"
+    echo
+    echo "Public URL:"
+    printf '  https://%s\n' "$FQDN"
+    final_qualify_installation
+    return $?
+}
+
+install_and_qualify_dashboard() {
+    local dashboard_rc=0
+    local version_json=""
+    local status_json=""
+    local runtime_meta=""
+    local socket_meta=""
+
+    echo
+    echo "=== PHASE: DASHBOARD INSTALLATION ==="
+    echo
+
+    set +e
+    "$DASHBOARD_INSTALLER"
+    dashboard_rc=$?
+    set -e
+
+    if [[ "$dashboard_rc" -ne 0 ]]; then
+        echo
+        echo "============================================================"
+        echo "NOUVEAU-VISION UNIT INSTALLATION STOPPED"
+        echo "============================================================"
+        echo
+        echo "Failed phase:"
+        echo "  Dashboard"
+        echo
+        printf 'Dashboard installer exit code:\n  %s\n' "$dashboard_rc"
+        echo
+        echo "Rollback ownership:"
+        echo "  install-dashboard.sh"
+        echo
+        echo "NVUN remains installed and synchronized."
+        echo "Web configuration was not started."
+        return 1
+    fi
+
+    echo
+    echo "=== POST-DASHBOARD QUALIFICATION ==="
+
+    systemctl is-active --quiet nvu-dashboard.service || {
+        echo "FAIL: nvu-dashboard.service is not active."
+        return 4
+    }
+
+    systemctl is-enabled --quiet nvu-dashboard.service || {
+        echo "FAIL: nvu-dashboard.service is not enabled."
+        return 4
+    }
+
+    [[ "$(systemctl show nvu-dashboard.service --property=User --value)" == "nvu" ]] || {
+        echo "FAIL: Dashboard service user is not nvu."
+        return 4
+    }
+
+    [[ "$(systemctl show nvu-dashboard.service --property=Group --value)" == "www-data" ]] || {
+        echo "FAIL: Dashboard service group is not www-data."
+        return 4
+    }
+
+    [[ "$(systemctl show nvu-dashboard.service --property=ExecStart --value)" == *"unix:/run/nvu-dashboard/nvu-dashboard.sock"* ]] || {
+        echo "FAIL: Dashboard service does not use canonical Unix socket."
+        return 4
+    }
+
+    runtime_meta="$(
+        stat -c '%U:%G %a %F' /run/nvu-dashboard 2>/dev/null || true
+    )"
+
+    [[ "$runtime_meta" == "nvu:www-data 750 directory" ]] || {
+        printf 'FAIL: Dashboard runtime contract differs: %s\n' \
+            "${runtime_meta:-unknown}"
+        return 4
+    }
+
+    socket_meta="$(
+        stat -c '%U:%G %a %F' \
+            /run/nvu-dashboard/nvu-dashboard.sock \
+            2>/dev/null || true
+    )"
+
+    [[ "$socket_meta" == "nvu:www-data 770 socket" ]] || {
+        printf 'FAIL: Dashboard socket contract differs: %s\n' \
+            "${socket_meta:-unknown}"
+        return 4
+    }
+
+    version_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 10 \
+            --unix-socket /run/nvu-dashboard/nvu-dashboard.sock \
+            http://localhost/api/version \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$version_json" |
+        jq -e \
+            '.dashboardVersion == "1.3.0"
+             and .ok == true
+             and .ticker == "NVU"' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: Dashboard version API qualification failed."
+                return 4
+            }
+
+    status_json="$(
+        curl \
+            --silent \
+            --show-error \
+            --fail \
+            --max-time 10 \
+            --unix-socket /run/nvu-dashboard/nvu-dashboard.sock \
+            http://localhost/api/status \
+            2>/dev/null || true
+    )"
+
+    printf '%s\n' "$status_json" |
+        jq -e \
+            '.ok == true
+             and .nvun.online == true
+             and .nvun.chain == "main"
+             and .nvun.initialBlockDownload == false' \
+            >/dev/null 2>&1 || {
+                echo "FAIL: Dashboard-to-NVUN qualification failed."
+                return 4
+            }
+
+    if ss -lntp 2>/dev/null |
+        grep -Eq ':8080[[:space:]].*(gunicorn|python|nvu-dashboard)'
+    then
+        echo "FAIL: Dashboard unexpectedly exposes TCP port 8080."
+        return 4
+    fi
+
+    echo "PASS: Dashboard service active and enabled."
+    echo "PASS: Dashboard service identity verified."
+    echo "PASS: Dashboard Unix-socket contract verified."
+    echo "PASS: Dashboard version 1.3.0 qualified."
+    echo "PASS: Dashboard reports synchronized mainnet NVUN."
+    echo "PASS: Dashboard has no TCP backend."
+
+    echo
+    echo "============================================================"
+    echo "B6.2I-3D DASHBOARD PHASE PASSED"
+    echo "============================================================"
+    echo
+    echo "NVUN:"
+    echo "  INSTALLED"
+    echo "  synchronized"
+    echo
+    echo "Dashboard:"
+    echo "  INSTALLED"
+    echo "  active"
+    echo "  enabled"
+    echo "  version 1.3.0"
+    echo "  Unix socket"
+    echo
+    echo "Web:"
+    echo "  NOT STARTED"
+    configure_and_qualify_web
+    return $?
+}
+
+command_install() {
+    local preflight_output=""
+    local preflight_rc=0
+    local preflight_result=""
+    local preflight_nvun=""
+    local preflight_dashboard=""
+    local preflight_web=""
+    local node_rc=0
+    local sync_rc=0
+
+    parse_fqdn "$@" || return $?
+    require_root || return $?
+
+    require_executable \
+        "$UNIFIED_PREFLIGHT" \
+        "Unified preflight" || return $?
+
+    require_executable \
+        "$NODE_INSTALLER" \
+        "NVUN installer" || return $?
+
+    require_executable \
+        "$DASHBOARD_INSTALLER" \
+        "Dashboard installer" || return $?
+
+    require_executable \
+        "$WEB_CONFIGURATOR" \
+        "Web configurator" || return $?
+
+    echo "============================================================"
+    echo "NOUVEAU-VISION UNIT INSTALLATION"
+    echo "B6.2I-3F"
+    echo "============================================================"
+    echo
+    printf 'FQDN:\n  %s\n' "$FQDN"
+
+    echo
+    echo "=== UNIFIED INSTALLATION PREFLIGHT ==="
+
+    set +e
+    preflight_output="$(
+        "$UNIFIED_PREFLIGHT" \
+            --fqdn "$FQDN" \
+            2>&1
+    )"
+    preflight_rc=$?
+    set -e
+
+    printf '%s\n' "$preflight_output"
+
+    preflight_result="$(
+        printf '%s\n' "$preflight_output" |
+        awk '
+            /^Result:$/ {
+                getline
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                print
+                exit
+            }
+        '
+    )"
+
+    preflight_nvun="$(
+        printf '%s\n' "$preflight_output" |
+        awk '
+            /^NVUN:$/ {
+                getline
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                print
+                exit
+            }
+        '
+    )"
+
+    preflight_dashboard="$(
+        printf '%s\n' "$preflight_output" |
+        awk '
+            /^Dashboard:$/ {
+                getline
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                print
+                exit
+            }
+        '
+    )"
+
+    preflight_web="$(
+        printf '%s\n' "$preflight_output" |
+        awk '
+            /^Web:$/ {
+                getline
+                gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+                print
+                exit
+            }
+        '
+    )"
+
+    echo
+    echo "=== ORCHESTRATION DECISION ==="
+    printf 'Preflight result:\n  %s\n' \
+        "${preflight_result:-UNKNOWN}"
+    printf 'Preflight exit code:\n  %s\n' \
+        "$preflight_rc"
+
+    case "$preflight_result" in
+        INSTALLED)
+            if [[ "$preflight_rc" -ne 0 ]]; then
+                echo
+                echo "FAIL: INSTALLED classification returned an unexpected exit code."
+                return 4
+            fi
+
+            echo
+            echo "PASS: complete Nouveau-Vision Unit installation detected."
+            echo "PASS: entering read-only final qualification."
+
+            final_qualify_installation
+            return $?
+            ;;
+
+        READY)
+            if [[ "$preflight_rc" -ne 0 ]]; then
+                echo
+                echo "FAIL: READY classification returned an unexpected exit code."
+                echo
+                echo "Changes made:"
+                echo "  none"
+                return 4
+            fi
+
+            echo
+            echo "PASS: clean target accepted for unified installation."
+            echo
+            echo "=== PHASE: NVUN INSTALLATION ==="
+            echo
+
+            set +e
+            "$NODE_INSTALLER" --install
+            node_rc=$?
+            set -e
+
+            if [[ "$node_rc" -ne 0 ]]; then
+                echo
+                echo "============================================================"
+                echo "NOUVEAU-VISION UNIT INSTALLATION STOPPED"
+                echo "============================================================"
+                echo
+                echo "Failed phase:"
+                echo "  NVUN"
+                echo
+                echo "Node installer exit code:"
+                printf '  %s\n' "$node_rc"
+                echo
+                echo "Rollback ownership:"
+                echo "  install-node.sh"
+                echo
+                echo "Dashboard:"
+                echo "  NOT STARTED"
+                echo
+                echo "Web:"
+                echo "  NOT STARTED"
+                return 1
+            fi
+
+            echo
+            echo "=== POST-NVUN QUALIFICATION ==="
+
+            if ! systemctl is-active --quiet nvun.service; then
+                echo "FAIL: nvun.service is not active after installation."
+                return 4
+            fi
+
+            if ! systemctl is-enabled --quiet nvun.service; then
+                echo "FAIL: nvun.service is not enabled after installation."
+                return 4
+            fi
+
+            if ! sudo -u nvu /usr/local/bin/nvu-cli                 -datadir=/var/lib/nvu/node                 -conf=/etc/nvu/nvun.conf                 getblockchaininfo >/dev/null 2>&1
+            then
+                echo "FAIL: NVUN RPC unavailable after installation."
+                return 4
+            fi
+
+            if ! sudo -u nvu /usr/local/bin/nvu-cli                 -datadir=/var/lib/nvu/node                 -conf=/etc/nvu/nvun.conf                 getwalletinfo |
+                jq -e                     '.walletname == ""
+                     and .private_keys_enabled == true'                     >/dev/null 2>&1
+            then
+                echo "FAIL: NVUN wallet contract unavailable after installation."
+                return 4
+            fi
+
+            if ! ss -lnt |
+                grep -Eq '127\.0\.0\.1:9332[[:space:]]'
+            then
+                echo "FAIL: NVUN localhost RPC listener not detected."
+                return 4
+            fi
+
+            if ! ss -lnt |
+                grep -Eq ':(9333)[[:space:]]'
+            then
+                echo "FAIL: NVUN P2P listener not detected."
+                return 4
+            fi
+
+            echo "PASS: NVUN service active."
+            echo "PASS: NVUN service enabled."
+            echo "PASS: NVUN RPC operational."
+            echo "PASS: NVUN wallet operational."
+            echo "PASS: NVUN listener contract verified."
+
+            set +e
+            wait_for_nvun_sync
+            sync_rc=$?
+            set -e
+
+            if [[ "$sync_rc" -ne 0 ]]; then
+                return "$sync_rc"
+            fi
+
+            echo
+            install_and_qualify_dashboard
+            return $?
+            ;;
+
+        PARTIAL)
+            if [[ "$preflight_nvun" == "INSTALLED" &&
+                  "$preflight_dashboard" == "NOT_INSTALLED" &&
+                  "$preflight_web" == "NOT_CONFIGURED" ]]
+            then
+                echo
+                echo "PASS: recognized safe node-only installation state."
+                echo "PASS: resuming at NVUN synchronization gate."
+
+                set +e
+                wait_for_nvun_sync
+                sync_rc=$?
+                set -e
+
+                if [[ "$sync_rc" -ne 0 ]]; then
+                    return "$sync_rc"
+                fi
+
+                echo
+                install_and_qualify_dashboard
+                return $?
+            fi
+
+            if [[ "$preflight_nvun" == "INSTALLED" &&
+                  "$preflight_dashboard" == "INSTALLED" &&
+                  "$preflight_web" == "NOT_CONFIGURED" ]]
+            then
+                echo
+                echo "PASS: recognized safe node-and-Dashboard installation state."
+                echo "PASS: resuming at web and HTTPS configuration."
+
+                configure_and_qualify_web
+                return $?
+            fi
+
+            echo
+            echo "NVU INSTALLATION BLOCKED"
+            echo
+            echo "Reason:"
+            echo "  An unsupported partial Nouveau-Vision Unit state exists."
+            echo
+            echo "Detected state:"
+            printf '  NVUN:      %s
+' "${preflight_nvun:-UNKNOWN}"
+            printf '  Dashboard: %s
+' "${preflight_dashboard:-UNKNOWN}"
+            printf '  Web:       %s
+' "${preflight_web:-UNKNOWN}"
+            echo
+            echo "Changes made:"
+            echo "  none"
+            return 3
+            ;;
+
+        BLOCKED)
+            echo
+            echo "NVU INSTALLATION BLOCKED"
+            echo
+            echo "Reason:"
+            echo "  Unified preflight detected a conflicting or unsafe state."
+            echo
+            echo "Changes made:"
+            echo "  none"
+            return 3
+            ;;
+
+        *)
+            echo
+            echo "NVU INSTALLATION NOT STARTED"
+            echo
+            echo "Reason:"
+            echo "  Unified preflight returned an unknown result."
+            echo
+            echo "Changes made:"
+            echo "  none"
+            return 4
+            ;;
+    esac
+}
+
+command_configure_web() {
+    parse_fqdn "$@" || return $?
+    require_root || return $?
+
+    require_executable \
+        "$WEB_CONFIGURATOR" \
+        "Web configurator" || return $?
+
+    exec "$WEB_CONFIGURATOR" \
+        --fqdn "$FQDN"
+}
+
+command_qualify() {
+    parse_fqdn "$@" || return $?
+    require_root || return $?
+
+    require_executable \
+        "$UNIFIED_PREFLIGHT" \
+        "Unified preflight" || return $?
+
+    final_qualify_installation
+}
+
+command_qualify_dashboard() {
+    require_executable \
+        "$DASHBOARD_QUALIFY" \
+        "Dashboard qualification" || return $?
+
+    exec "$DASHBOARD_QUALIFY" "$@"
+}
+
+main() {
+    local command="${1:-help}"
+
+    case "$command" in
+        version)
+            shift
+            command_version "$@"
+            ;;
+
+        status)
+            shift
+            command_status "$@"
+            ;;
+
+        preflight)
+            shift
+            command_preflight "$@"
+            ;;
+
+        install)
+            shift
+            command_install "$@"
+            ;;
+
+        qualify)
+            shift
+            command_qualify "$@"
+            ;;
+
+        qualify-dashboard)
+            shift
+            command_qualify_dashboard "$@"
+            ;;
+
+        configure-web)
+            shift
+            command_configure_web "$@"
+            ;;
+
+        help|-h|--help)
+            usage
+            ;;
+
+        *)
+            printf 'FAIL: unknown command: %s\n\n' \
+                "$command" >&2
+            usage >&2
+            return 2
+            ;;
+    esac
+}
+
+main "$@"

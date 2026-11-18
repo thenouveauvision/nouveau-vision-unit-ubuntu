@@ -1,0 +1,60 @@
+[Unit]
+Description=Nouveau-Vision Unit Node Daemon
+Documentation=https://nvu.us
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=nvu
+Group=nvu
+UMask=0077
+
+ExecStart=/usr/local/bin/nvund -datadir=/var/lib/nvu/node -conf=/etc/nvu/nvun.conf
+ExecStop=/usr/local/bin/nvu-cli -datadir=/var/lib/nvu/node -conf=/etc/nvu/nvun.conf stop
+
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120s
+TimeoutStopSec=180s
+KillSignal=SIGTERM
+KillMode=mixed
+SuccessExitStatus=0 143
+
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RemoveIPC=true
+MemoryDenyWriteExecute=true
+
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+ReadOnlyPaths=/etc/nvu
+ReadWritePaths=/var/lib/nvu/node
+ReadWritePaths=/var/log/nvu/nvun
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nvund
+
+[Install]
+WantedBy=multi-user.target

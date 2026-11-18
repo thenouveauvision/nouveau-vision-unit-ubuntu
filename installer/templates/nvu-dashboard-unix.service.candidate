@@ -1,0 +1,33 @@
+[Unit]
+Description=NVU Dashboard
+Requires=nvun.service
+After=network-online.target nvun.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=nvu
+Group=www-data
+SupplementaryGroups=nvu
+
+WorkingDirectory=/usr/local/lib/nvu/dashboard/current
+
+Environment=HOME=/var/lib/nvu
+Environment=PYTHONDONTWRITEBYTECODE=1
+
+RuntimeDirectory=nvu-dashboard
+RuntimeDirectoryMode=0750
+
+ExecStart=/usr/local/lib/nvu/dashboard/venv/bin/gunicorn --bind unix:/run/nvu-dashboard/nvu-dashboard.sock --umask 007 --workers 1 --threads 2 --timeout 30 --access-logfile - --error-logfile - --log-level info server:app
+
+Restart=on-failure
+RestartSec=5
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/nvu-dashboard
+
+[Install]
+WantedBy=multi-user.target
